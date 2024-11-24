@@ -37,7 +37,7 @@ use gazebo::prelude::*;
 use crate::starlark::collections::SmallMap;
 use allocative::Allocative;
 use dupe::Dupe;
-use pyo3::types::{PyDict, PyTuple};
+use pyo3::types::{PyAny, PyDict, PyTuple};
 use starlark::analysis::AstModuleLint;
 use starlark::eval::Arguments;
 use starlark::starlark_simple_value;
@@ -94,6 +94,58 @@ fn serde_to_starlark<'v>(x: serde_json::Value, heap: &'v Heap) -> anyhow::Result
 
 // }}}
 
+// {{{ DataclassInstanceValue - represents instances of dataclasses
+
+#[derive(Debug, ProvidesStaticType, NoSerialize, Allocative)]
+struct DataclassInstanceValue {
+    #[allocative(skip)]
+    instance: PyObject,
+}
+starlark_simple_value!(DataclassInstanceValue);
+
+impl Display for DataclassInstanceValue {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        Python::with_gil(|py| {
+            let repr = self
+                .instance
+                .as_ref(py)
+                .str()
+                .map(|s| s.to_string())
+                .unwrap_or_else(|_| "<python dataclass instance>".to_string());
+            write!(f, "{}", repr)
+        })
+    }
+}
+
+#[starlark_value(type = "dataclass_instance")]
+impl<'v> StarlarkValue<'v> for DataclassInstanceValue {
+    fn get_attr(&self, attribute: &str, heap: &'v Heap) -> Option<Value<'v>> {
+        Python::with_gil(|py| -> Option<Value<'v>> {
+            let attr_value = self.instance.getattr(py, attribute).ok()?;
+            pyobject_to_value(attr_value, heap).ok()
+        })
+    }
+
+    fn has_attr(&self, attribute: &str, _heap: &'v Heap) -> bool {
+        Python::with_gil(|py| self.instance.as_ref(py).hasattr(attribute).unwrap_or(false))
+    }
+}
+
+// }}}
+
+// {{{ Helper functions for dataclass conversion
+
+fn is_dataclass(obj: &PyAny) -> bool {
+    Python::with_gil(|py| {
+        let dataclasses = py.import("dataclasses").ok()?;
+        let is_dataclass = dataclasses.getattr("is_dataclass").ok()?;
+        is_dataclass.call1((obj,)).ok()?.extract::<bool>().ok()
+    })
+    .unwrap_or(false)
+}
+
+// }}}
+
 fn value_to_pyobject(value: Value) -> PyResult<PyObject> {
     let json_val = convert_anyhow_err(value.to_json())?;
     Python::with_gil(|py| {
@@ -104,6 +156,18 @@ fn value_to_pyobject(value: Value) -> PyResult<PyObject> {
 
 fn pyobject_to_value<'v>(obj: PyObject, heap: &'v Heap) -> PyResult<Value<'v>> {
     Python::with_gil(|py| -> PyResult<Value<'v>> {
+        let obj_ref = obj.as_ref(py);
+
+        // Check if object is a dataclass type
+        if is_dataclass(obj_ref) {
+            return Ok(heap.alloc(DataclassInstanceValue { instance: obj }));
+        }
+
+        // Check if object is a callable
+        if obj_ref.is_callable() {
+            return Ok(heap.alloc(PythonCallableValue { callable: obj }));
+        }
+
         let json = py.import_bound("json")?;
         let json_str: String = json.getattr("dumps")?.call1((obj,))?.extract()?;
         convert_anyhow_err(serde_to_starlark(
