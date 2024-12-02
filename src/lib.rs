@@ -37,7 +37,7 @@ use gazebo::prelude::*;
 use crate::starlark::collections::SmallMap;
 use allocative::Allocative;
 use dupe::Dupe;
-use pyo3::types::{PyAny, PyDict, PyTuple};
+use pyo3::types::{PyAny, PyDict, PyTuple, PyType};
 use starlark::analysis::AstModuleLint;
 use starlark::eval::Arguments;
 use starlark::starlark_simple_value;
@@ -136,12 +136,55 @@ impl<'v> StarlarkValue<'v> for DataclassInstanceValue {
 // {{{ Helper functions for dataclass conversion
 
 fn is_dataclass(obj: &PyAny) -> bool {
-    Python::with_gil(|py| {
-        let dataclasses = py.import("dataclasses").ok()?;
-        let is_dataclass = dataclasses.getattr("is_dataclass").ok()?;
-        is_dataclass.call1((obj,)).ok()?.extract::<bool>().ok()
-    })
-    .unwrap_or(false)
+    let result: PyResult<bool> = (|| {
+        let dataclasses = match obj.py().import("dataclasses") {
+            Ok(module) => module,
+            Err(_) => return Ok(false),
+        };
+
+        // Use dataclasses.is_dataclass() function
+        match dataclasses.getattr("is_dataclass") {
+            Ok(func) => func.call1((obj,))?.extract(),
+            Err(_) => Ok(false),
+        }
+    })();
+
+    result.unwrap_or(false)
+}
+
+fn is_attrs_instance(obj: &PyAny) -> bool {
+    let result: PyResult<bool> = (|| {
+        // Check if object has __attrs_attrs__ attribute
+        // This is a reliable way to detect attrs classes
+        match obj.getattr("__attrs_attrs__") {
+            Ok(_) => Ok(true),
+            Err(_) => Ok(false),
+        }
+    })();
+
+    result.unwrap_or(false)
+}
+
+fn is_pydantic_instance(obj: &PyAny) -> bool {
+    let result: PyResult<bool> = (|| {
+        // Try to import pydantic - return false if not available
+        let pydantic = match obj.py().import("pydantic") {
+            Ok(module) => module,
+            Err(_) => return Ok(false),
+        };
+
+        // Get BaseModel class - return false if attribute not found
+        let base_model: &PyType = match pydantic.getattr("BaseModel") {
+            Ok(cls) => cls.downcast()?,
+            Err(_) => return Ok(false),
+        };
+
+        // Check if object is instance of BaseModel
+        obj.is_instance(base_model)
+    })();
+
+    // Convert PyResult<bool> to bool, defaulting to false on any error
+    result.unwrap_or(false)
 }
 
 // }}}
@@ -159,7 +202,7 @@ fn pyobject_to_value<'v>(obj: PyObject, heap: &'v Heap) -> PyResult<Value<'v>> {
         let obj_ref = obj.as_ref(py);
 
         // Check if object is a dataclass type
-        if is_dataclass(obj_ref) {
+        if is_dataclass(obj_ref) || is_attrs_instance(obj_ref) || is_pydantic_instance(obj_ref) {
             return Ok(heap.alloc(DataclassInstanceValue { instance: obj }));
         }
 
