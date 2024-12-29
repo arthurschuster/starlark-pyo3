@@ -71,6 +71,40 @@ def test_python_callable_with_kwargs():
 
 # }}}
 
+# {{{ python objects
+
+PYTHON_OBJECT_STAR = """
+another_obj = MyObject(21)
+my_obj.method() - another_obj.method()
+"""
+
+
+def test_python_objects():
+    glb = sl.Globals.standard()
+    mod = sl.Module()
+
+    class MyObject:
+        def __init__(self, value):
+            self.value = value
+
+        def method(self):
+            return self.value * 2
+
+    mod["my_obj"] = MyObject(42)
+    mod["MyObject"] = MyObject
+
+    ast = sl.parse("python-object.star", PYTHON_OBJECT_STAR)
+
+    val = sl.eval(mod, ast, glb)
+
+    assert val == 42
+
+    obj = mod["another_obj"]
+
+    assert isinstance(obj, MyObject)
+    assert obj.value == 21
+
+# }}}
 
 # {{{ module loading
 

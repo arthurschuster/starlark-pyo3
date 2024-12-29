@@ -35,6 +35,7 @@ use crate::pyo3::prelude::*;
 use gazebo::prelude::*;
 
 use crate::starlark::collections::SmallMap;
+use crate::starlark::values::ValueLike;
 use allocative::Allocative;
 use dupe::Dupe;
 use pyo3::types::{PyDict, PyTuple};
@@ -94,7 +95,99 @@ fn serde_to_starlark<'v>(x: serde_json::Value, heap: &'v Heap) -> anyhow::Result
 
 // }}}
 
+// {{{ PythonObjectValue
+
+#[derive(Debug, ProvidesStaticType, NoSerialize, Allocative)]
+struct PythonObjectValue {
+    #[allocative(skip)]
+    obj: PyObject,
+}
+starlark_simple_value!(PythonObjectValue);
+
+impl Display for PythonObjectValue {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        Python::with_gil(|py| write!(f, "<python object: {}>", self.obj.bind(py).repr().unwrap()))
+    }
+}
+
+#[starlark_value(type = "python_object")]
+impl<'v> StarlarkValue<'v> for PythonObjectValue {
+    fn invoke(
+        &self,
+        _me: Value<'v>,
+        args: &Arguments<'v, '_>,
+        eval: &mut starlark::eval::Evaluator<'v, '_>,
+    ) -> starlark::Result<Value<'v>> {
+        Python::with_gil(|py| -> starlark::Result<Value<'v>> {
+            // Handle positional arguments
+            let py_args: Vec<PyObject> = convert_to_starlark_err(
+                (args
+                    .positions(eval.heap())?
+                    .map(|v| -> PyResult<PyObject> { value_to_pyobject(v) }))
+                .collect::<PyResult<Vec<PyObject>>>(),
+            )?;
+
+            // Handle named arguments
+            let py_kwargs = PyDict::new_bound(py);
+            for name in args.names_map()?.iter() {
+                let key = name.0.as_str();
+                let val = convert_to_starlark_err(value_to_pyobject(*name.1))?;
+                convert_to_starlark_err(py_kwargs.set_item(key, val))?;
+            }
+
+            // Try to call the object if it's callable
+            let bound_obj = self.obj.bind(py);
+            if bound_obj.is_callable() {
+                convert_to_starlark_err(pyobject_to_value(
+                    convert_to_starlark_err(
+                        bound_obj.call(PyTuple::new_bound(py, py_args), Some(&py_kwargs)),
+                    )?
+                    .into(),
+                    eval.heap(),
+                ))
+            } else {
+                Err(anyhow::anyhow!("Python object is not callable").into())
+            }
+        })
+    }
+
+    fn get_attr(&self, attribute: &str, heap: &'v Heap) -> Option<Value<'v>> {
+        Python::with_gil(|py| -> Option<Value<'v>> {
+            match self.obj.getattr(py, attribute) {
+                Ok(attr_value) => match pyobject_to_value(attr_value, heap) {
+                    Ok(val) => Some(val),
+                    Err(_) => None,
+                },
+                Err(_) => None,
+            }
+        })
+    }
+
+    fn has_attr(&self, attribute: &str, _heap: &'v Heap) -> bool {
+        Python::with_gil(|py| self.obj.bind(py).hasattr(attribute).unwrap_or(false))
+    }
+
+    fn dir_attr(&self) -> Vec<String> {
+        Python::with_gil(|py| {
+            if let Ok(dir_list) = self.obj.bind(py).dir() {
+                dir_list
+                    .iter()
+                    .filter_map(|name| name.extract::<String>().ok())
+                    .collect()
+            } else {
+                Vec::new()
+            }
+        })
+    }
+}
+
+// }}}
+
 fn value_to_pyobject(value: Value) -> PyResult<PyObject> {
+    if let Some(py_obj) = value.downcast_ref::<PythonObjectValue>() {
+        return Python::with_gil(|py| Ok(py_obj.obj.clone_ref(py)));
+    }
+
     let json_val = convert_anyhow_err(value.to_json())?;
     Python::with_gil(|py| {
         let json = py.import_bound("json")?;
@@ -105,11 +198,21 @@ fn value_to_pyobject(value: Value) -> PyResult<PyObject> {
 fn pyobject_to_value<'v>(obj: PyObject, heap: &'v Heap) -> PyResult<Value<'v>> {
     Python::with_gil(|py| -> PyResult<Value<'v>> {
         let json = py.import_bound("json")?;
-        let json_str: String = json.getattr("dumps")?.call1((obj,))?.extract()?;
-        convert_anyhow_err(serde_to_starlark(
-            convert_serde_err(serde_json::from_str(&json_str))?,
-            heap,
-        ))
+
+        // Try JSON serialization first
+        match json.getattr("dumps")?.call1((obj.clone_ref(py),)) {
+            Ok(json_str) => {
+                let json_str: String = json_str.extract()?;
+                convert_anyhow_err(serde_to_starlark(
+                    convert_serde_err(serde_json::from_str(&json_str))?,
+                    heap,
+                ))
+            }
+            Err(_) => {
+                // If JSON serialization fails, wrap in PythonObjectValue
+                Ok(heap.alloc(PythonObjectValue { obj: obj }))
+            }
+        }
     })
 }
 
