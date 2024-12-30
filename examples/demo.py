@@ -29,7 +29,7 @@ def g(x):
     return 2 * x
 
 
-mod.add_callable("g", g)
+mod["g"] = g
 
 ast = sl.parse("a.star", A_STAR)
 

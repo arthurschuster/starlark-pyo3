@@ -43,7 +43,7 @@ def test_python_callable():
     def g(x):
         return 2 * x
 
-    mod.add_callable("g", g)
+    mod["g"] = g
 
     ast = sl.parse("python-callable.star", PYTHON_CALLABLE_STAR)
 
@@ -61,7 +61,7 @@ def test_python_callable_with_kwargs():
     def g(x):
         return 2 * x
 
-    mod.add_callable("g", g)
+    mod["g"] = g
 
     ast = sl.parse("python-callable-with-kwargs.star", "g(x=a)")
 

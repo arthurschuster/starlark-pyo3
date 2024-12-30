@@ -706,65 +706,10 @@ impl Globals {
 
 // }}}
 
-// {{{ PythonCallableValue
-
-#[derive(Debug, ProvidesStaticType, NoSerialize, Allocative)]
-struct PythonCallableValue {
-    #[allocative(skip)]
-    callable: PyObject,
-}
-starlark_simple_value!(PythonCallableValue);
-
-impl Display for PythonCallableValue {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "<python callable>")
-    }
-}
-
-#[starlark_value(type = "python_callable_value")]
-impl<'v> StarlarkValue<'v> for PythonCallableValue {
-    fn invoke(
-        &self,
-        _me: Value<'v>,
-        args: &Arguments<'v, '_>,
-        eval: &mut starlark::eval::Evaluator<'v, '_>,
-    ) -> starlark::Result<Value<'v>> {
-        Python::with_gil(|py| -> starlark::Result<Value<'v>> {
-            // Handle positional arguments
-            let py_args: Vec<PyObject> = convert_to_starlark_err(
-                (args
-                    .positions(eval.heap())?
-                    .map(|v| -> PyResult<PyObject> { value_to_pyobject(v) }))
-                .collect::<PyResult<Vec<PyObject>>>(),
-            )?;
-
-            // Handle named arguments.
-            let py_kwargs = PyDict::new_bound(py);
-            for name in args.names_map()?.iter() {
-                let key = name.0.as_str();
-                let val = convert_to_starlark_err(value_to_pyobject(*name.1))?;
-                convert_to_starlark_err(py_kwargs.set_item(key, val))?;
-            }
-
-            convert_to_starlark_err(pyobject_to_value(
-                convert_to_starlark_err(self.callable.call_bound(
-                    py,
-                    PyTuple::new_bound(py, py_args),
-                    Some(&py_kwargs),
-                ))?,
-                eval.heap(),
-            ))
-        })
-    }
-}
-
-// }}}
-
 // {{{ Module
 
 /// .. automethod:: __getitem__
 /// .. automethod:: __setitem__
-/// .. automethod:: add_callable
 /// .. automethod:: freeze
 #[pyclass]
 struct Module(starlark::environment::Module);
@@ -787,15 +732,6 @@ impl Module {
     fn __setitem__(&self, name: &str, obj: PyObject) -> PyResult<()> {
         self.0.set(name, pyobject_to_value(obj, self.0.heap())?);
         Ok(())
-    }
-
-    #[pyo3(text_signature = "(name: str, callable: Callable) -> None")]
-    fn add_callable(&self, name: &str, callable: PyObject) {
-        let b = self
-            .0
-            .heap()
-            .alloc(PythonCallableValue { callable: callable });
-        self.0.set(name, b);
     }
 
     fn freeze(mod_cell: &Bound<Module>) -> PyResult<FrozenModule> {
